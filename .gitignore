@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.Rdata
+.httr-oauth
+.DS_Store
+Analysis/Results/
+Analysis/Archive/
+Analysis/*.tex
+Archive/
+Sims/Results/
+R/Archive/
+R/test/
+Data/Archive/
+Stan/Archive/

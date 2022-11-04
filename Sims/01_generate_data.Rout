@@ -1,0 +1,230 @@
+
+R version 4.1.0 (2021-05-18) -- "Camp Pontanezen"
+Copyright (C) 2021 The R Foundation for Statistical Computing
+Platform: x86_64-pc-linux-gnu (64-bit)
+
+R is free software and comes with ABSOLUTELY NO WARRANTY.
+You are welcome to redistribute it under certain conditions.
+Type 'license()' or 'licence()' for distribution details.
+
+  Natural language support but running in an English locale
+
+R is a collaborative project with many contributors.
+Type 'contributors()' for more information and
+'citation()' on how to cite R or R packages in publications.
+
+Type 'demo()' for some demos, 'help()' for on-line help, or
+'help.start()' for an HTML browser interface to help.
+Type 'q()' to quit R.
+
+CmdStan path set to: /nas/longleaf/home/cococo/.cmdstanr/cmdstan-2.30.1
+> ################################################################################
+> # Version 3 Summary of changes:
+> # - In age/int: half/half scenario, those with diff int must have diff age
+> # - Add a variety of different intercepts and means to consideration
+> # - Only first outcome (pchg_pasi_16) is assessed
+> ################################################################################
+> 
+> remove(list=ls())
+> library(caret)
+Loading required package: ggplot2
+Loading required package: lattice
+> library(dplyr)
+
+Attaching package: ‘dplyr’
+
+The following objects are masked from ‘package:stats’:
+
+    filter, lag
+
+The following objects are masked from ‘package:base’:
+
+    intersect, setdiff, setequal, union
+
+> 
+> ################################################################################
+> #                                 PAREMETERS
+> ################################################################################
+> 
+> # 1. Paths
+> dir='/proj/ibrahimlab/leap/sims_ps/Data'
+> dir_out_cur=file.path(dir, 'current')
+> dir_out_hist=file.path(dir, 'historical')
+> 
+> # 2. Data specs
+> analysis=readRDS(file.path(dir, 'gendata_analysis.rds')) # contains data distributions
+> grid=expand.grid('age'=c(0, 0.5, 1),# hist data scenarios
++                  'int'=c(0, 0.5, 1),
++                  'q'=c(0.25, 0.50, 0.75), # size of unexchangeable (h0) parameters
++                  stringsAsFactors=FALSE) %>%
++   filter(!(int==0 & age==0 & q>0.25)) %>% # remove equivalent scenarios
++   mutate(q=ifelse(age==0&int==0, 1, q)) # set q=1 for fully exch case
+> id=as.numeric(Sys.getenv('SLURM_ARRAY_TASK_ID'))         # id of scenario for this run
+> 
+> # 3. Computation specs
+> ntry=30000 # max no. of tries used to generate historical data
+> mymax.pcterr=10 # how close to get beta_hat to beta
+> 
+> 
+> ################################################################################
+> #                                   SETUP
+> ################################################################################
+> 
+> if (is.na(id)) {id=1}
+> 
+> for (j in seq_along(analysis)) {
++   assign(names(analysis)[j], analysis[[j]]) # loads variables from `analysis`
++ }
+> 
+> ## GET HIST DATA MEANS ##
+> x.cont.mean.h0=x.cont.mean # current means
+> x.cont.mean.h0['age']=log(exp(x.cont.mean['age'])*grid[id, 'q']) # modified means
+> 
+> ## GET HIST DATA REGRESSION PARAMS ##
+> beta.list.h0=beta.list.h1 # current params
+> beta.list.h0=lapply(beta.list.h0, function(x) {x[1]=x[1]*grid[id, 'q']; x}) # modified intercept: 4x smaller
+> 
+> beta.h1.ctrl=unlist(lapply(beta.list.h1, function(x) x[-2])) # removes treatment effect for current control
+> beta.h0.ctrl=unlist(lapply(beta.list.h0, function(x) x[-2])) # removes treatment effect for modified control
+> 
+> ## Rescale Sigma to reasonable range for simulations
+> scale=1/diag(Sigma)
+> Sigma=diag(sqrt(scale)) %*% Sigma %*% diag(sqrt(scale))
+> 
+> 
+> ################################################################################
+> #                         GENERATE HISTORICAL DATA
+> ################################################################################
+> 
+> ## FUNCTION TO GENERATE ONE DATASET ##
+> gendata <- function(n, prop.x.cont.mean.h0, prop.beta.list.h0, prob.trt) {
++   dat = data.frame()
++   
++   ## Draw continuous covariates: age, pasi_bl, bsa_bl
++   n.h1 = floor(n*(1-prop.x.cont.mean.h0))
++   n.h0 = ceiling(n*prop.x.cont.mean.h0)
++   if (n.h1!=0) {
++     dat = mvtnorm::rmvnorm(n=n.h1, mean=x.cont.mean, sigma=x.cont.cov)
++   }
++   if (n.h0!=0) {
++     dat = mvtnorm::rmvnorm(n=n.h0, mean=x.cont.mean.h0, sigma=x.cont.cov) %>% rbind(dat)
++   }
++   dat = dat %>% exp( ) %>% data.frame() %>% mutate(age=ifelse(age>85, 85, age),
++                                                    bsa_bl=ifelse(bsa_bl>86, 86, bsa_bl)) # truncate max obs to age=85 and bsa_bl=86
++   
++   dat.scale=data.frame(scale(dat))
++   
++   ## Draw discrete covariates: smoke, prior_systemic (dependent on cont vars)
++   for ( j in seq_along(xnames.fact) ) {
++     Xj=model.matrix(x.rhs.formula.list[[j]], dat.scale)
++     dat.scale[[xnames.fact[j]]]= rbinom(n, 1, binomial()$linkinv(Xj %*% coef(mle.disc[[j]])))
++   }
++   dat[,xnames.fact] <- dat.scale[,xnames.fact]
++   
++   ## Draw treatment assignment
++   dat$treatment <- dat.scale$treatment <- rbinom(n, 1, prob.trt)
++   
++   ## Draw responses: pchg_pasi_16, chg_dlqi_16, pchg_bsa_16
++   dat[,ynames] <- dat.scale[,ynames] <- 0
++   z=rbinom(n, 1, prop.beta.list.h0) # Use current beta when z=0, use modified beta when z=1
++   Xdatlist = lapply(formula.list, function(f) model.matrix(f, dat.scale))
++   Xb = mapply(function(X, beta) X %*% beta, X=Xdatlist, beta.list.h1)
++   Xb.h0 = mapply(function(X, beta) X %*% beta, X=Xdatlist, beta.list.h0)
++   Xb[z==1,] = Xb.h0[z==1,]
++   Y = Xb + mvtnorm::rmvnorm(n, sigma=Sigma)
++   dat.scale[,ynames]=Y
++   
++   list = list(dat=dat, dat.scale=dat.scale, mean.age=mean(dat$age))
++   list
++ }
+> 
+> ## GENERATE DATA UNTIL IT HAS BETA_HAT CLOSE TO TRUE BETA ##
+> gendata_looper <- function(n=n00, prop.x.cont.mean.h0, prop.beta.list.h0, prob.trt=0) {
++   if (prop.beta.list.h0==0) beta=beta.h1.ctrl
++   if (prop.beta.list.h0==1) beta=beta.h0.ctrl
++   for (i in 1:ntry) {
++     set.seed(i)
++     gendata          =gendata(n, prop.x.cont.mean.h0, prop.beta.list.h0, prob.trt)
++     histdata = gendata$dat.scale
++     fitlist          =lapply(formula.list, function(f) lm(f, data=histdata))
++     betahat          =unlist(sapply(fitlist, function(f) coef(f)))
++     max.pcterr       =max(abs(betahat[names(betahat)!='treatment']/beta - 1)*100)
++     if (max.pcterr < mymax.pcterr) {
++       break
++     } else if (i==1 || max.pcterr < max.pcterr.best) {
++       max.pcterr.best = max.pcterr
++       i.best = i
++     } else if (i==ntry) { # if could not find max.pcterr < mymax.pcterr, just take the best available max.pcterr
++       set.seed(i.best)
++       list             =gendata(n, prop.x.cont.mean.h0, prop.beta.list.h0, prob.trt)
++       histdata = gendata$dat.scale
++       fitlist          =lapply(formula.list, function(f) lm(f, data=histdata))
++       betahat          =unlist(sapply(fitlist, function(f) coef(f)))
++       max.pcterr       =max(abs(betahat[names(betahat)!='treatment']/beta - 1)*100)
++     }
++   }
++   list = list(data=histdata, i=i, max.pcterr=max.pcterr, mean.age=gendata$mean.age, betahat=betahat)
++   list
++ }
+> 
+> 
+> if (grid[id, "int"]!=0.5) {
++   histdata = gendata_looper(n00, grid[id, "age"], grid[id, "int"], prob.trt=0)
++ } else { # Instead of prop.beta.list.h0=0.5 we have to generate separately
++   p_age_0 <- p_age_1 <- grid[id, "age"]
++   if (grid[id, "age"]==0.5) { # half/half case: make sure those with diff int have diff age
++     p_age_0 = 0
++     p_age_1 = 1
++   }
++   histdata0 = gendata_looper(floor(n00/2), p_age_0, 0, prob.trt=0)
++   histdata1 = gendata_looper(ceiling(n00/2), p_age_1, 1, prob.trt=0)
++   histdata = list(data = rbind(histdata0$data, histdata1$data),
++                   i = paste0(histdata0$i, ', ', histdata1$i),
++                   max.pcterr = paste0(histdata0$max.pcterr, ', ', histdata1$max.pcterr),
++                   mean.age = paste0(histdata0$mean.age, ', ', histdata1$mean.age),
++                   betahat = paste0(histdata0$betahat, ' ,', histdata1$betahat))
++ }
+> out = list('data'=histdata$data,
++            'x.cont.mean.h1'=x.cont.mean,
++            'x.cont.mean.h0'=x.cont.mean.h0,
++            'prop.x.cont.mean.h0'=grid[id, "age"],
++            'beta.list.h0'=beta.list.h0,
++            'beta.list.h1'=beta.list.h1,
++            'prop.beta.list.h0'=grid[id, "int"],
++            'q'=grid[id, 'q'],
++            'i'=histdata$i,
++            'max.pcterr'=histdata$max.pcterr,
++            'mean.age'=histdata$mean.age,
++            'betahat'=histdata$betahat)
+> 
+> 
+> saveRDS(out, file=file.path(dir_out_hist, paste0('histdata_', id, '.rds')))
+> 
+> 
+> 
+> # ### comment out before running file
+> # for (i in 1:25) {
+> #   assign(paste0("histdata_", i), readRDS(paste0("/proj/ibrahimlab/leap/sims_ps/Data/historical/histdata_", i, ".rds")))
+> #   View(get(paste0("histdata_", i)), paste0("histdata_", i))
+> # }
+> 
+> ################################################################################
+> #                         GENERATE CURRENT DATA
+> ################################################################################
+> # 
+> # if (id==1) {
+> #   for (i in 1:ncurdatasets) {
+> #     set.seed(i)
+> #     curdat=gendata(ncurmax, prop.x.cont.mean.h0=0, prop.beta.list.h0=0, prob.trt=2/3)
+> #     curdat=list(
+> #       'data'=curdat,
+> #       'beta'=beta.list.h1
+> #     )
+> #     saveRDS(curdat, file=file.path(dir_out_cur, paste0('curdata_', i, '.rds')))
+> #   }
+> # }
+> 
+> 
+> proc.time()
+    user   system  elapsed 
+1647.220   10.181 1676.482 
